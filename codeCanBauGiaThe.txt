@@ -1,0 +1,258 @@
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include "HX711.h"
+#include <Preferences.h> 
+#include <ArduinoJson.h>
+#include <WiFiManager.h>
+
+// --- Cấu hình MQTT ---
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* topic_data = "ogenki_farm_scale_99/data";
+const char* topic_cmd = "farm/scales/C_0001/cmd";
+
+#define DOUT 4             
+#define CLK  5             
+#define SETUP_SWITCH 13    
+#define HX711_POWER_PIN 12 
+
+HX711 scale;
+Preferences preferences; 
+
+float calibration_factor; 
+int sleep_time;                   
+long offset_val; 
+char device_id[10] = "C_0001";       
+unsigned long start_time;            
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+void hx711_power_on() {
+  digitalWrite(HX711_POWER_PIN, HIGH);
+  delay(100); 
+}
+
+void hx711_power_off() {
+  digitalWrite(HX711_POWER_PIN, LOW);
+}
+
+void saveConfig() {
+  preferences.putFloat("calib", calibration_factor);
+  preferences.putInt("sleep", sleep_time);
+  preferences.putLong("offset", offset_val);
+  preferences.putString("id", String(device_id));
+  Serial.println(">>> [NVS] DA LUU CAU HINH MOI VAO FLASH.");
+}
+
+void loadConfig() {
+  preferences.begin("scale_cfg", false); 
+  calibration_factor = preferences.getFloat("calib", 105230.0);
+  sleep_time = preferences.getInt("sleep", 5);
+  offset_val = preferences.getLong("offset", 0);
+  String tempID = preferences.getString("id", "C_0001");
+  tempID.toCharArray(device_id, 10);
+  Serial.println("------------------------------------------");
+  Serial.printf("[NVS] DU LIEU: ID=%s | Calib=%.1f | Sleep=%ds | Offset=%ld\n", device_id, calibration_factor, sleep_time, offset_val);
+  Serial.println("------------------------------------------");
+}
+
+// Hàm xử lý ngủ an toàn (Tắt cảm biến trước khi ngủ)
+void goToSleep(String reason) {
+  Serial.printf("[SYSTEM] %s. Vao Deep Sleep %d giay...\n", reason.c_str(), sleep_time);
+  hx711_power_off();
+  Serial.flush();
+  ESP.deepSleep(sleep_time * 1e6);
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  
+  Serial.printf("\n[MQTT] NHAN LENH TU SERVER: %s\n", message.c_str());
+
+  StaticJsonDocument<200> doc;
+  deserializeJson(doc, message);
+
+  bool isChanged = false;
+  if (doc.containsKey("tare")) {
+    Serial.println("[ACTION] DANG TIEN HANH TARE (LAY DIEM 0)...");
+    hx711_power_on(); 
+    offset_val = scale.read_average(20); 
+    scale.set_offset(offset_val); 
+    isChanged = true;
+    Serial.printf("[ACTION] TARE XONG. OFFSET MOI: %ld\n", offset_val);
+  }
+  
+  if (doc.containsKey("calib")) {
+    calibration_factor = doc["calib"];
+    scale.set_scale(calibration_factor);
+    isChanged = true;
+    Serial.printf("[ACTION] CAP NHAT CALIB: %.1f\n", calibration_factor);
+  }
+
+  if (doc.containsKey("sleep_time")) {
+    sleep_time = doc["sleep_time"];
+    isChanged = true;
+    Serial.printf("[ACTION] CAP NHAT SLEEP TIME: %d giay\n", sleep_time);
+  }
+
+  if (isChanged) saveConfig();
+}
+
+void setup() {
+  start_time = millis(); 
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n=== HE THONG THUC DAY ===");
+
+  pinMode(SETUP_SWITCH, INPUT_PULLUP); 
+  pinMode(HX711_POWER_PIN, OUTPUT);
+  
+  loadConfig(); 
+
+  WiFiManager wm;
+  String resetReason = ESP.getResetReason();
+  Serial.println("[SYSTEM] Nguyen nhan khoi dong: " + resetReason);
+
+  // --- LOGIC 1: CHỈ CẤU HÌNH WIFI KHI GẠT SETUP VÀ NHẤN RESET (HOẶC VỪA CẤP NGUỒN) ---
+  if (digitalRead(SETUP_SWITCH) == LOW && (resetReason == "External System" || resetReason == "Power on")) {
+    Serial.println("[MODE] CONFIG: Dang xoa WiFi cu va phat AP...");
+    wm.resetSettings(); 
+    wm.setAPStaticIPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    
+    String apName = "TramCan_Config_" + String(ESP.getChipId());
+    if (!wm.startConfigPortal(apName.c_str(), "88888888")) {
+       Serial.println("[WIFI] Het thoi gian cho portal, khoi dong lai...");
+       delay(2000);
+       ESP.restart();
+    }
+    Serial.println("[WIFI] Da nhap WiFi moi thanh cong!");
+  } 
+  else {
+    // --- LOGIC 2: CHẾ ĐỘ RUN HOẶC SETUP (GIỮ KẾT NỐI WIFI CŨ) ---
+    if (digitalRead(SETUP_SWITCH) == LOW) {
+      Serial.println("[MODE] SETUP: Giu ket noi WiFi cu, truyen du lieu lien tuc.");
+    } else {
+      Serial.println("[MODE] RUN: Truyen 1 lan roi ngu.");
+    }
+
+    WiFi.begin(); // Kết nối theo thông tin WiFiManager đã lưu trước đó
+
+    Serial.print("[WIFI] Dang ket noi.");
+    int wifi_retry = 0;
+    while (WiFi.status() != WL_CONNECTED && wifi_retry < 100) { // Timeout 10 giây (100 * 100ms)
+      delay(100);
+      if (wifi_retry % 10 == 0) Serial.print(".");
+      wifi_retry++;
+    }
+    
+    // FAIL-SAFE 1: NẾU KHÔNG KẾT NỐI ĐƯỢC WIFI -> ĐI NGỦ ĐỂ BẢO VỆ PIN
+    if (WiFi.status() != WL_CONNECTED) {
+      goToSleep("FAIL-SAFE: Khong the ket noi WiFi");
+    }
+  }
+
+  Serial.println("\n[WIFI] KET NOI THANH CONG!");
+  Serial.printf("[WIFI] IP: %s | RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+  // Khởi tạo cảm biến
+  hx711_power_on(); 
+  scale.begin(DOUT, CLK);
+  scale.set_scale(calibration_factor);
+  scale.set_offset(offset_val);
+
+  Serial.print("[HX711] DANG DOC CAN NANG...");
+  float weight = scale.get_units(10); 
+  if (weight < 0 && weight > -0.05) weight = 0;
+  Serial.printf(" => KET QUA: %.2f kg\n", weight);
+  hx711_power_off(); 
+
+  // Kết nối MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  Serial.print("[MQTT] KET NOI BROKER...");
+  int mqtt_retry = 0;
+  while (!client.connected() && mqtt_retry < 3) { // Thử kết nối 3 lần
+    if (client.connect(device_id)) {
+      Serial.println(" OK!");
+      client.subscribe(topic_cmd);
+    } else {
+      Serial.print(".");
+      delay(1000);
+      mqtt_retry++;
+    }
+  }
+
+  // FAIL-SAFE 2: NẾU KHÔNG KẾT NỐI ĐƯỢC MQTT -> ĐI NGỦ ĐỂ BẢO VỆ PIN
+  if (!client.connected()) {
+     goToSleep("FAIL-SAFE: Khong the ket noi MQTT Broker");
+  }
+
+  // Gửi dữ liệu lần đầu sau khi thức
+  String modeStr = (digitalRead(SETUP_SWITCH) == LOW) ? "Setup" : "Run";
+  String payload = "{\"id\":\"" + String(device_id) + "\",\"weight\":" + String(weight, 2) + 
+                   ",\"calib\":" + String(calibration_factor, 1) + ",\"mode\":\"" + modeStr + 
+                   "\",\"uptime\":" + String(millis() - start_time) + "}";
+  client.publish(topic_data, payload.c_str());
+  Serial.println("[MQTT] DA GUI DU LIEU LÊN SERVER.");
+
+  // Nếu đang ở RUN mode -> Chờ nhận lệnh nhanh rồi đi ngủ
+  if (digitalRead(SETUP_SWITCH) == HIGH) {
+    unsigned long wait_cmd = millis();
+    while(millis() - wait_cmd < 1000) {
+      client.loop();
+      delay(10);
+    }
+    goToSleep("HOAN TAT CHU KY RUN");
+  }
+}
+
+void loop() {
+  // --- CHỈ CHẠY VÀO LOOP KHI ĐANG Ở CHẾ ĐỘ SETUP (GẠT CÔNG TẮC D7 XUỐNG GND) ---
+  
+  // Tự động kết nối lại WiFi nếu rớt mạng trong lúc Setup
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[WIFI] Mat ket noi! Dang thu lai...");
+    WiFi.begin();
+    delay(2000);
+    return; // Dừng loop chờ có mạng
+  }
+
+  // Tự động kết nối lại MQTT nếu rớt mạng trong lúc Setup
+  if (!client.connected()) {
+    Serial.print("[MQTT] Dang ket noi lai...");
+    if (client.connect(device_id)) {
+      client.subscribe(topic_cmd);
+      Serial.println(" OK!");
+    } else {
+      Serial.println(" Thu lai sau 5s.");
+      delay(5000);
+    }
+    return; // Dừng loop chờ có MQTT
+  }
+  
+  client.loop(); // Lắng nghe các lệnh Tare, Calib, Sleep Time từ Server
+
+  // Đọc và in cân nặng mới mỗi 2 giây
+  static unsigned long last_pub = 0;
+  if (millis() - last_pub > 2000) {
+    hx711_power_on(); 
+    float current_weight = scale.get_units(5);
+    hx711_power_off();
+
+    String payload = "{\"id\":\"" + String(device_id) + "\",\"weight\":" + String(current_weight, 2) + 
+                     ",\"mode\":\"Setup\",\"uptime\":" + String(millis() - start_time) + "}";
+    client.publish(topic_data, payload.c_str());
+    
+    Serial.printf("[SETUP LIVE] Can nang: %.2f kg | Calib: %.1f\n", current_weight, calibration_factor);
+    last_pub = millis();
+  }
+
+  // Nếu trong lúc đang Setup mà người dùng gạt công tắc lên mức HIGH -> Chuyển về RUN và Ngủ
+  if (digitalRead(SETUP_SWITCH) == HIGH) {
+    Serial.println("\n[MODE] NGUOI DUNG CHUYEN SANG RUN.");
+    goToSleep("CHUYEN SANG CHE DO RUN");
+  }
+}
